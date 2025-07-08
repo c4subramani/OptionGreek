@@ -1,0 +1,295 @@
+from breeze_connect import BreezeConnect
+from datetime import datetime, timedelta, time
+import urllib
+import warnings
+import pandas as pd
+from py_vollib.black_scholes import black_scholes
+from py_vollib.black_scholes.greeks.numerical import delta, gamma, theta, vega, rho
+from scipy.optimize import brentq
+import numpy as np
+from tabulate import tabulate
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings('ignore')
+
+# --- ANSI Escape Codes for Colors and Backgrounds ---
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW_BG = "\033[43m" # Background Yellow
+RESET = "\033[0m" # Resets color and background to default
+
+# --- API Credentials and Connection ---
+# IMPORTANT: Replace "YOUR_SESSION_TOKEN_HERE" with your actual session token.
+# This token needs to be generated each time you want to connect if it's a one-time session token.
+app_key = "YOUR_APP_KEY"
+secret_key = "YOUR_SECRET_KEY"
+session_key = "YOUR_SESSION_KEY" # REPLACE WITH YOUR CURRENT SESSION KEY
+
+breeze = BreezeConnect(api_key=str(app_key))
+breeze.generate_session(api_secret=str(secret_key), session_token=str(session_key))
+
+# --- Constants ---
+risk_free_rate = 0.0725  # 7.25%
+
+# --- Helper Functions for Greeks Calculation ---
+
+def calculate_implied_volatility_from_ltp(row, r_val):
+    S = row['spot_price']
+    K = row['strike_price']
+    T = (pd.to_datetime(row['expiry_date']) - pd.Timestamp.now()).days / 365
+    option_price = row['ltp']
+    right = row['right'].lower()
+
+    def objective_function(sigma):
+        if right == 'call':
+            option_type = 'c'
+        elif right == 'put':
+            option_type = 'p'
+        else:
+            raise ValueError("Invalid option type")
+        if T <= 0.001: # Handle very small or negative time to expiry
+            return option_price # Return option_price to make it 0 in objective function if T invalid
+        return black_scholes(option_type, S, K, T, r_val, sigma) - option_price
+
+    try:
+        # Search for implied volatility between 0.01 (1%) and 5.0 (500%)
+        implied_vol = brentq(objective_function, 0.01, 5.0)
+        return implied_vol
+    except ValueError:
+        return np.nan
+
+def calculate_greeks_from_implied_vol(row, r_val):
+    S = row['spot_price']
+    K = row['strike_price']
+    T = (pd.to_datetime(row['expiry_date']) - pd.Timestamp.now()).days / 365
+    sigma = row['IV']
+    right = row['right'].lower()
+
+    if pd.isna(sigma) or T <= 0.001: # Handle very small or negative time to expiry
+        return pd.Series([np.nan, np.nan, np.nan, np.nan],
+                         index=['Delta', 'Gamma', 'Theta', 'Vega'])
+
+    if right == 'call':
+        option_type = 'c'
+    elif right == 'put':
+        option_type = 'p'
+    else:
+        raise ValueError("Invalid option type")
+
+    delta_value = delta(option_type, S, K, T, r_val, sigma)
+    gamma_value = gamma(option_type, S, K, T, r_val, sigma)
+    theta_value = theta(option_type, S, K, T, r_val, sigma)
+    vega_value = vega(option_type, S, K, T, r_val, sigma)
+
+    return pd.Series([delta_value, gamma_value, theta_value, vega_value],
+                     index=['Delta', 'Gamma', 'Theta', 'Vega'])
+
+# --- Main Function to Process Option Chain Data for a Single Option Type ---
+
+def get_and_process_single_option_type_chain(option_type_str, breeze_connection, r_val):
+    # Find ATM strike Price
+    quotes_response = breeze_connection.get_quotes(stock_code="NIFTY",
+                                                   exchange_code="NSE",
+                                                   expiry_date="",
+                                                   product_type="cash",
+                                                   right="",
+                                                   strike_price="")
+    try:
+        Spot = quotes_response["Success"][0]["ltp"]
+    except (KeyError, IndexError) as e:
+        print(f"Error fetching NIFTY spot price: {e}")
+        return None, None, None # Also return None for ATM
+    
+    ATM = round((Spot) / 50) * 50
+
+    # Determine the next Thursday expiry for NIFTY options from today
+    today = datetime.now()
+    # Check if today is Thursday and current time is past 3:30 PM IST (market close for derivatives)
+    # If so, find next Thursday, otherwise current Thursday
+    days_until_thursday = (3 - today.weekday() + 7) % 7
+    if today.weekday() == 3 and today.time() > time(15, 30):
+        days_until_thursday = 7
+    next_thursday = today + timedelta(days=days_until_thursday)
+    future_expiry_date = next_thursday.strftime("%Y-%m-%dT06:00:00.000Z") # Breeze API expects UTC time
+
+    try:
+        df_raw = breeze_connection.get_option_chain_quotes(stock_code="NIFTY",
+                                                         exchange_code="NFO",
+                                                         product_type="options",
+                                                         expiry_date=future_expiry_date,
+                                                         right=option_type_str)["Success"]
+    except KeyError as e:
+        print(f"Error fetching {option_type_str.capitalize()} option chain: {e}")
+        return None, None, None
+
+    df = pd.DataFrame(df_raw)
+
+    required_cols = ['strike_price', 'ltp', 'right', 'stock_code', 'expiry_date', 'open_interest']
+    if not all(col in df.columns for col in required_cols):
+        print(f"Missing required columns in {option_type_str.capitalize()} data: {df.columns.tolist()}")
+        return None, None, None
+
+    df['strike_price'] = df['strike_price'].astype(float)
+    df['ltp'] = pd.to_numeric(df['ltp'], errors='coerce')
+    df['open_interest'] = pd.to_numeric(df['open_interest'], errors='coerce')
+
+    target_strike = ATM
+    strike_increment = 50
+    range_size_lower = 5 # 5 strikes below ATM
+    range_size_upper = 6 # 6 strikes above ATM
+
+    lower_bound = target_strike - range_size_lower * strike_increment
+    upper_bound = target_strike + range_size_upper * strike_increment
+
+    # Filter for the desired strike range and increment
+    filtered_df = df[(df['strike_price'] >= lower_bound) &
+                     (df['strike_price'] <= upper_bound) &
+                     (df['strike_price'] % strike_increment == 0)].copy()
+
+    # Filter out rows with invalid LTP or OI for calculations
+    filtered_df = filtered_df[filtered_df['ltp'].notna() & (filtered_df['ltp'] > 0)]
+    filtered_df = filtered_df[filtered_df['open_interest'].notna()]
+
+    if filtered_df.empty:
+        return Spot, None, ATM # Return Spot and ATM even if df is empty
+
+    sorted_df = filtered_df.sort_values('strike_price').reset_index(drop=True)
+
+    # Generate expected strike prices within the range
+    expected_strikes = [target_strike - i * strike_increment for i in range(range_size_lower, 0, -1)] + \
+                       [target_strike] + \
+                       [target_strike + i * strike_increment for i in range(1, range_size_upper + 1)]
+    
+    # Filter the sorted_df to exactly match the expected strikes
+    final_df = sorted_df[sorted_df['strike_price'].isin(expected_strikes)].copy()
+    
+    # If some expected strikes are missing, fill them with NaNs to maintain structure
+    missing_strikes = set(expected_strikes) - set(final_df['strike_price'].values)
+    for strike in sorted(list(missing_strikes)):
+        missing_row = pd.Series({'strike_price': strike, 'stock_code': 'NIFTY', 'right': option_type_str, # Keep stock_code for now to identify Nifty
+                                 'ltp': np.nan, 'open_interest': np.nan, 'expiry_date': future_expiry_date})
+        final_df = pd.concat([final_df, pd.DataFrame([missing_row])], ignore_index=True)
+    
+    final_df = final_df.sort_values('strike_price').reset_index(drop=True)
+
+
+    final_df['spot_price'] = Spot
+    final_df['IV'] = final_df.apply(calculate_implied_volatility_from_ltp, axis=1, args=(r_val,))
+
+    # Calculate Greeks even if IV is NaN, they will just be NaN
+    greeks_df = final_df.apply(calculate_greeks_from_implied_vol, axis=1, args=(r_val,))
+    result_df = pd.concat([final_df, greeks_df], axis=1)
+
+    # Round values
+    result_df['IV'] = result_df['IV'].round(4)
+    result_df['Delta'] = result_df['Delta'].round(4)
+    result_df['Gamma'] = result_df['Gamma'].round(6)
+    result_df['Theta'] = result_df['Theta'].round(2)
+    result_df['Vega'] = result_df['Vega'].round(2)
+    result_df['Open_Interest_Millions'] = (result_df['open_interest'] / 1_000_000).round(2)
+
+    return Spot, result_df, ATM
+
+# --- Execute and Combine Results ---
+
+spot_price_call, call_options_df, atm_strike = get_and_process_single_option_type_chain("call", breeze, risk_free_rate)
+spot_price_put, put_options_df, _ = get_and_process_single_option_type_chain("put", breeze, risk_free_rate) # ATM is the same for both
+
+if call_options_df is not None and put_options_df is not None and atm_strike is not None:
+    # Select and rename columns for Call side
+    call_df_for_merge = call_options_df.rename(columns={
+        'ltp': 'Ltp_Call',
+        'IV': 'IV_Call',
+        'Delta': 'Delta_Call',
+        'Gamma': 'Gamma_Call',
+        'Theta': 'Theta_Call',
+        'Vega': 'Vega_Call',
+        'Open_Interest_Millions': 'OI_Call_Millions'
+    })[['strike_price', 'IV_Call', 'Delta_Call', 'Gamma_Call', 'Theta_Call', 'Vega_Call', 'Ltp_Call', 'OI_Call_Millions']] # Removed 'stock_code'
+
+    # Select and rename columns for Put side
+    put_df_for_merge = put_options_df.rename(columns={
+        'ltp': 'Ltp_Put',
+        'IV': 'IV_Put',
+        'Delta': 'Delta_Put',
+        'Gamma': 'Gamma_Put',
+        'Theta': 'Theta_Put',
+        'Vega': 'Vega_Put',
+        'Open_Interest_Millions': 'OI_Put_Millions'
+    })[['strike_price', 'Ltp_Put', 'IV_Put', 'Delta_Put', 'Gamma_Put', 'Theta_Put', 'Vega_Put', 'OI_Put_Millions']]
+
+    # Merge the two dataframes on 'strike_price'
+    combined_df = pd.merge(call_df_for_merge, put_df_for_merge, on='strike_price', how='outer') # Use outer to keep all strikes
+    combined_df = combined_df.sort_values('strike_price').reset_index(drop=True)
+
+    # Define the final column order as per image_19e450.png, excluding 'stock_code'
+    final_columns_order = [
+        'IV_Call', 'Delta_Call', 'Gamma_Call', 'Theta_Call', 'Vega_Call', 'Ltp_Call', 'OI_Call_Millions',
+        'strike_price',
+        'Ltp_Put', 'IV_Put', 'Delta_Put', 'Gamma_Put', 'Theta_Put', 'Vega_Put', 'OI_Put_Millions'
+    ]
+
+    # Select and reorder columns
+    combined_df = combined_df[final_columns_order].copy()
+
+    # Find highest OI for coloring (only non-NaN values)
+    max_oi_call_val = combined_df['OI_Call_Millions'].max() if not combined_df['OI_Call_Millions'].empty else np.nan
+    max_oi_put_val = combined_df['OI_Put_Millions'].max() if not combined_df['OI_Put_Millions'].empty else np.nan
+
+    # Function to apply formatting and coloring
+    def format_cell(value, column, is_atm_row, max_call_oi, max_put_oi):
+        # Convert NaN values to empty strings for cleaner display in the table
+        if pd.isna(value) or value == '':
+            display_value = ''
+        elif 'OI_Call_Millions' == column:
+            display_value = f"{value:.2f}"
+            if value == max_call_oi:
+                display_value = f"{RED}{display_value}{RESET}"
+        elif 'OI_Put_Millions' == column:
+            display_value = f"{value:.2f}"
+            if value == max_put_oi:
+                display_value = f"{GREEN}{display_value}{RESET}"
+        elif 'IV' in column or 'Delta' in column:
+            display_value = f"{value:.4f}"
+        elif 'Gamma' in column:
+            display_value = f"{value:.6f}"
+        elif 'Theta' in column or 'Vega' in column or 'Ltp' in column or 'strike_price' == column:
+            display_value = f"{value:.2f}" # Strike price can be float, format to 2 decimals if needed
+        else:
+            display_value = str(value)
+
+        if is_atm_row:
+            return f"{YELLOW_BG}{display_value}{RESET}"
+        return display_value
+
+    # Apply formatting and coloring row by row for tabulate
+    table_data = []
+    for index, row in combined_df.iterrows():
+        is_atm_row = (row['strike_price'] == atm_strike)
+        formatted_row = []
+        for col in final_columns_order:
+            formatted_row.append(format_cell(row[col], col, is_atm_row, max_oi_call_val, max_oi_put_val))
+        table_data.append(formatted_row)
+
+    # Prepare headers for tabulate to match the image exactly
+    headers_list = [
+        'IV', 'Delta', 'Gamma', 'Theta', 'Vega', 'Ltp', 'OI(M)',
+        'Strike',
+        'Ltp', 'IV', 'Delta', 'Gamma', 'Theta', 'Vega', 'OI(M)'
+    ]
+
+    print(f"\nNIFTY Spot Price: {spot_price_call:.2f} | ATM Strike: {atm_strike:.0f}")
+    print("----------------------------------------------------------------------------------------------------------------------------------------------------")
+    print("|                                      Call                               |                                  Put                                   |")
+    print("----------------------------------------------------------------------------------------------------------------------------------------------------")
+    print(tabulate(table_data, headers=headers_list, tablefmt='fancy_grid', showindex=False))
+
+elif call_options_df is None and put_options_df is None:
+    print("No valid option chain data retrieved for both Call and Put.")
+    print("Please check your session_key and API status.")
+elif call_options_df is None:
+    print("No valid Call option chain data retrieved.")
+    print("Please check your session_key and API status.")
+elif put_options_df is None:
+    print("No valid Put option chain data retrieved.")
+    print("Please check your session_key and API status.")
