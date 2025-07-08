@@ -1,0 +1,510 @@
+from breeze_connect import BreezeConnect
+from datetime import datetime, timedelta, time
+import urllib
+import warnings
+import pandas as pd
+from py_vollib.black_scholes import black_scholes
+from py_vollib.black_scholes.greeks.numerical import delta, gamma, theta, vega, rho
+from scipy.optimize import brentq
+import numpy as np
+from tabulate import tabulate
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings('ignore')
+
+# --- ANSI Escape Codes for Colors and Backgrounds ---
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW_BG = "\033[43m"
+RESET = "\033[0m"
+
+# --- API Credentials and Connection ---
+app_key = "YOUR_APP_KEY"
+secret_key = "YOUR_SECRET_KEY"
+session_key = "YOUR_SESSION_KEY"
+
+try:
+    breeze = BreezeConnect(api_key=str(app_key))
+    session_response = breeze.generate_session(api_secret=str(secret_key), session_token=str(session_key))
+    print("Session generated successfully!")
+except Exception as e:
+    print(f"Error connecting to Breeze API: {e}")
+    exit()
+
+# --- Constants ---
+risk_free_rate = 0.0725
+
+# --- Helper Functions ---
+def validate_api_response(response, operation_name):
+    if not response:
+        print(f"{operation_name}: No response received")
+        return False
+    if response.get("Status") != 200:
+        print(f"{operation_name}: API returned status {response.get('Status')}")
+        print(f"Error: {response.get('Error', 'Unknown error')}")
+        return False
+    if not response.get("Success"):
+        print(f"{operation_name}: No data in response")
+        return False
+    return True
+
+def calculate_time_to_expiry(expiry_date_str):
+    try:
+        if 'T' in expiry_date_str:
+            expiry_date = pd.to_datetime(expiry_date_str)
+        elif '-' in expiry_date_str and len(expiry_date_str.split('-')) == 3:
+            parts = expiry_date_str.split('-')
+            if len(parts[1]) == 3:
+                expiry_date = datetime.strptime(expiry_date_str, "%d-%b-%Y")
+            else:
+                expiry_date = pd.to_datetime(expiry_date_str, format='%Y-%m-%d')
+        else:
+            expiry_date = pd.to_datetime(expiry_date_str)
+        
+        now = datetime.now()
+        time_diff = (expiry_date - now).total_seconds() / (24 * 3600 * 365)
+        return max(time_diff, 1/365)
+    except Exception as e:
+        print(f"Error parsing expiry date {expiry_date_str}: {e}")
+        return 1/365
+
+def calculate_implied_volatility_from_ltp(row, r_val):
+    S = row['spot_price']
+    K = row['strike_price']
+    T = calculate_time_to_expiry(row['expiry_date'])
+    option_price = row['ltp']
+    right = row['right'].lower()
+
+    if pd.isna(option_price) or option_price <= 0:
+        return np.nan
+    if pd.isna(S) or pd.isna(K) or S <= 0 or K <= 0:
+        return np.nan
+
+    def objective_function(sigma):
+        try:
+            option_type = 'c' if right == 'call' else 'p'
+            theoretical_price = black_scholes(option_type, S, K, T, r_val, sigma)
+            return theoretical_price - option_price
+        except Exception:
+            return float('inf')
+
+    try:
+        if right == 'call' and option_price >= max(S - K, 0):
+            implied_vol = brentq(objective_function, 0.001, 5.0)
+        elif right == 'put' and option_price >= max(K - S, 0):
+            implied_vol = brentq(objective_function, 0.001, 5.0)
+        else:
+            implied_vol = brentq(objective_function, 0.01, 3.0)
+        return max(implied_vol, 0.001)
+    except (ValueError, RuntimeError):
+        return np.nan
+
+def calculate_greeks_from_implied_vol(row, r_val):
+    S = row['spot_price']
+    K = row['strike_price']
+    T = calculate_time_to_expiry(row['expiry_date'])
+    sigma = row['IV']
+    right = row['right'].lower()
+
+    if pd.isna(sigma) or sigma <= 0:
+        return pd.Series([np.nan, np.nan, np.nan, np.nan],
+                         index=['Delta', 'Gamma', 'Theta', 'Vega'])
+
+    try:
+        option_type = 'c' if right == 'call' else 'p'
+        delta_value = delta(option_type, S, K, T, r_val, sigma)
+        gamma_value = gamma(option_type, S, K, T, r_val, sigma)
+        theta_value = theta(option_type, S, K, T, r_val, sigma)
+        vega_value = vega(option_type, S, K, T, r_val, sigma)
+
+        return pd.Series([delta_value, gamma_value, theta_value, vega_value],
+                         index=['Delta', 'Gamma', 'Theta', 'Vega'])
+    except Exception as e:
+        print(f"Error calculating Greeks for Strike {K}: {e}")
+        return pd.Series([np.nan, np.nan, np.nan, np.nan],
+                         index=['Delta', 'Gamma', 'Theta', 'Vega'])
+
+def get_available_expiry_dates(breeze_connection):
+    try:
+        today = datetime.now()
+        days_until_tuesday = (1 - today.weekday() + 7) % 7
+        if days_until_tuesday == 0:
+            days_until_tuesday = 7
+        next_tuesday = today + timedelta(days=days_until_tuesday)
+        
+        expiry_formats = [
+            next_tuesday.strftime("%d-%b-%Y"),
+            next_tuesday.strftime("%Y-%m-%d"),
+            next_tuesday.strftime("%Y-%m-%dT06:00:00.000Z")
+        ]
+        
+        for expiry_format in expiry_formats:
+            try:
+                sample_response = breeze_connection.get_option_chain_quotes(
+                    stock_code="BSESEN",
+                    exchange_code="BFO",
+                    product_type="options",
+                    expiry_date=expiry_format,
+                    right="call"
+                )
+                
+                if validate_api_response(sample_response, f"Sample expiry fetch with {expiry_format}"):
+                    expiry_dates = list(set([item['expiry_date'] for item in sample_response["Success"]]))
+                    expiry_dates.sort()
+                    return expiry_dates
+            except:
+                continue
+        
+        tuesday_expiries = []
+        for weeks in range(4):
+            future_tuesday = next_tuesday + timedelta(weeks=weeks)
+            tuesday_expiries.append(future_tuesday.strftime("%d-%b-%Y"))
+        return tuesday_expiries
+        
+    except Exception as e:
+        print(f"Error fetching expiry dates: {e}")
+        return [datetime.now().strftime("%d-%b-%Y")]
+
+def select_expiry_date(breeze_connection):
+    print("Fetching available expiry dates...")
+    expiry_dates = get_available_expiry_dates(breeze_connection)
+    
+    if not expiry_dates:
+        today = datetime.now()
+        days_until_tuesday = (1 - today.weekday() + 7) % 7
+        if days_until_tuesday == 0:
+            days_until_tuesday = 7
+        next_tuesday = today + timedelta(days=days_until_tuesday)
+        return next_tuesday.strftime("%d-%b-%Y")
+    
+    print("\nAvailable Expiry Dates:")
+    print("-" * 40)
+    
+    for i, expiry in enumerate(expiry_dates):
+        print(f"{i + 1}. {expiry}")
+    
+    print("-" * 40)
+    
+    while True:
+        try:
+            choice = input(f"Select expiry date (1-{len(expiry_dates)}): ").strip()
+            choice_idx = int(choice) - 1
+            
+            if 0 <= choice_idx < len(expiry_dates):
+                selected_expiry = expiry_dates[choice_idx]
+                print(f"Selected: {selected_expiry}")
+                return selected_expiry
+            else:
+                print(f"Please enter a number between 1 and {len(expiry_dates)}")
+        except ValueError:
+            print("Please enter a valid number")
+        except KeyboardInterrupt:
+            print("\nOperation cancelled by user")
+            return None
+
+# --- FIXED: Main Processing Function with Proper Data Type Handling ---
+def get_and_process_single_option_type_chain(option_type_str, breeze_connection, r_val, selected_expiry_date):
+    # FIXED: Get spot price with proper data type conversion
+    spot_price = None
+    
+    # Method 1: Try quotes API
+    try:
+        quotes_response = breeze_connection.get_quotes(
+            stock_code="BSESEN",
+            exchange_code="BSE",
+            expiry_date="",
+            product_type="cash",
+            right="",
+            strike_price=""
+        )
+        
+        if validate_api_response(quotes_response, "Spot price fetch"):
+            spot_price_raw = quotes_response["Success"][0]["ltp"]
+            spot_price = pd.to_numeric(spot_price_raw, errors='coerce')
+            if spot_price and spot_price > 0:
+                print(f"SENSEX Spot Price (from quotes): {spot_price}")
+    except Exception as e:
+        print(f"Error fetching spot price from quotes: {e}")
+    
+    # Method 2: If spot price is still None or 0, try from options data
+    if not spot_price or spot_price <= 0:
+        try:
+            option_response = breeze_connection.get_option_chain_quotes(
+                stock_code="BSESEN",
+                exchange_code="BFO",
+                product_type="options",
+                expiry_date=selected_expiry_date,
+                right=option_type_str
+            )
+            
+            if validate_api_response(option_response, f"Getting spot from {option_type_str} options"):
+                df_temp = pd.DataFrame(option_response["Success"])
+                if 'spot_price' in df_temp.columns:
+                    # FIXED: Convert to numeric properly
+                    spot_from_options_raw = df_temp['spot_price'].iloc[0]
+                    spot_from_options = pd.to_numeric(spot_from_options_raw, errors='coerce')
+                    
+                    if spot_from_options and spot_from_options > 0:
+                        spot_price = spot_from_options
+                        print(f"SENSEX Spot Price (from options data): {spot_price}")
+        except Exception as e:
+            print(f"Error fetching spot price from options: {e}")
+    
+    # Method 3: Use a reasonable default if still no spot price
+    if not spot_price or spot_price <= 0:
+        spot_price = 82000  # Reasonable SENSEX level as fallback
+        print(f"Using fallback SENSEX Spot Price: {spot_price}")
+    
+    # Calculate ATM
+    ATM = round(spot_price / 100) * 100
+    
+    # Get options data
+    try:
+        option_response = breeze_connection.get_option_chain_quotes(
+            stock_code="BSESEN",
+            exchange_code="BFO",
+            product_type="options",
+            expiry_date=selected_expiry_date,
+            right=option_type_str
+        )
+        
+        if not validate_api_response(option_response, f"{option_type_str.capitalize()} option chain"):
+            return None, None, None
+            
+        df_raw = option_response["Success"]
+        
+    except Exception as e:
+        print(f"Error fetching {option_type_str.capitalize()} option chain: {e}")
+        return None, None, None
+
+    df = pd.DataFrame(df_raw)
+    
+    print(f"Raw {option_type_str} data columns: {df.columns.tolist()}")
+    print(f"Raw {option_type_str} data shape: {df.shape}")
+
+    required_cols = ['strike_price', 'ltp', 'right', 'stock_code', 'expiry_date', 'open_interest']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    
+    if missing_cols:
+        print(f"Missing required columns in {option_type_str.capitalize()} data: {missing_cols}")
+        return None, None, None
+
+    # Convert data types
+    df['strike_price'] = pd.to_numeric(df['strike_price'], errors='coerce')
+    df['ltp'] = pd.to_numeric(df['ltp'], errors='coerce')
+    df['open_interest'] = pd.to_numeric(df['open_interest'], errors='coerce')
+
+    # Debug: Show strike price range
+    print(f"Strike price range: {df['strike_price'].min()} to {df['strike_price'].max()}")
+    print(f"ATM calculated as: {ATM}")
+    
+    # Remove rows with invalid data
+    df = df.dropna(subset=['strike_price', 'ltp'])
+    df = df[df['ltp'] > 0]
+
+    if df.empty:
+        print(f"No valid {option_type_str} data after filtering")
+        return spot_price, None, ATM
+
+    # Strike range filtering
+    target_strike = ATM
+    strike_increment = 100
+    range_size_lower = 10
+    range_size_upper = 10
+
+    lower_bound = target_strike - range_size_lower * strike_increment
+    upper_bound = target_strike + range_size_upper * strike_increment
+
+    print(f"Looking for strikes between {lower_bound} and {upper_bound}")
+
+    # Filter for the desired strike range
+    filtered_df = df[(df['strike_price'] >= lower_bound) &
+                     (df['strike_price'] <= upper_bound)].copy()
+
+    print(f"Found {len(filtered_df)} options in range")
+
+    if filtered_df.empty:
+        print(f"No options in calculated range. Taking closest strikes to {ATM}")
+        df_sorted = df.sort_values('strike_price')
+        
+        below_atm = df_sorted[df_sorted['strike_price'] <= ATM].tail(5)
+        above_atm = df_sorted[df_sorted['strike_price'] > ATM].head(5)
+        
+        filtered_df = pd.concat([below_atm, above_atm]).sort_values('strike_price')
+        
+        if filtered_df.empty:
+            print(f"Still no {option_type_str} options found")
+            return spot_price, None, ATM
+
+    final_df = filtered_df.sort_values('strike_price').reset_index(drop=True)
+    final_df['spot_price'] = spot_price
+
+    # Calculate IV and Greeks
+    print(f"Calculating Greeks for {option_type_str.upper()} options...")
+    
+    final_df['IV'] = final_df.apply(
+        lambda row: calculate_implied_volatility_from_ltp(row, r_val) if pd.notna(row['ltp']) and row['ltp'] > 0 else np.nan, 
+        axis=1
+    )
+
+    greeks_df = final_df.apply(
+        lambda row: calculate_greeks_from_implied_vol(row, r_val) if pd.notna(row['IV']) else pd.Series([np.nan, np.nan, np.nan, np.nan], index=['Delta', 'Gamma', 'Theta', 'Vega']), 
+        axis=1
+    )
+    
+    result_df = pd.concat([final_df, greeks_df], axis=1)
+
+    # Round values for display
+    result_df['IV'] = result_df['IV'].round(4)
+    result_df['Delta'] = result_df['Delta'].round(4)
+    result_df['Gamma'] = result_df['Gamma'].round(6)
+    result_df['Theta'] = result_df['Theta'].round(2)
+    result_df['Vega'] = result_df['Vega'].round(2)
+    result_df['Open_Interest_Millions'] = (result_df['open_interest'] / 1_000_000).round(2)
+
+    return spot_price, result_df, ATM
+
+def test_api_connection(breeze_connection):
+    print("Testing API connection...")
+    
+    try:
+        funds_response = breeze_connection.get_funds()
+        if validate_api_response(funds_response, "Funds test"):
+            print("✓ Funds API working")
+        else:
+            print("✗ Funds API failed")
+            
+        quotes_response = breeze_connection.get_quotes(
+            stock_code="BSESEN",
+            exchange_code="BSE",
+            expiry_date="",
+            product_type="cash",
+            right="",
+            strike_price=""
+        )
+        if validate_api_response(quotes_response, "Quotes test"):
+            print("✓ Quotes API working")
+            return True
+        else:
+            print("✗ Quotes API failed")
+            return False
+            
+    except Exception as e:
+        print(f"✗ API connection test failed: {e}")
+        return False
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    print("=" * 60)
+    print("SENSEX OPTIONS GREEKS CALCULATOR")
+    print("=" * 60)
+    
+    if not test_api_connection(breeze):
+        print("\nAPI connection failed.")
+        exit()
+    
+    print("\n✓ API connection successful!")
+    
+    selected_expiry = select_expiry_date(breeze)
+
+    if selected_expiry is None:
+        print("No expiry date selected. Exiting...")
+        exit()
+
+    print(f"\nProcessing options data for expiry: {selected_expiry}")
+    print("=" * 60)
+
+    # Execute and Combine Results
+    spot_price_call, call_options_df, atm_strike = get_and_process_single_option_type_chain("call", breeze, risk_free_rate, selected_expiry)
+    spot_price_put, put_options_df, _ = get_and_process_single_option_type_chain("put", breeze, risk_free_rate, selected_expiry)
+
+    if call_options_df is not None and put_options_df is not None and atm_strike is not None:
+        # Select and rename columns for Call side
+        call_df_for_merge = call_options_df.rename(columns={
+            'ltp': 'Ltp_Call',
+            'IV': 'IV_Call',
+            'Delta': 'Delta_Call',
+            'Gamma': 'Gamma_Call',
+            'Theta': 'Theta_Call',
+            'Vega': 'Vega_Call',
+            'Open_Interest_Millions': 'OI_Call_Millions'
+        })[['strike_price', 'IV_Call', 'Delta_Call', 'Gamma_Call', 'Theta_Call', 'Vega_Call', 'Ltp_Call', 'OI_Call_Millions']]
+
+        # Select and rename columns for Put side
+        put_df_for_merge = put_options_df.rename(columns={
+            'ltp': 'Ltp_Put',
+            'IV': 'IV_Put',
+            'Delta': 'Delta_Put',
+            'Gamma': 'Gamma_Put',
+            'Theta': 'Theta_Put',
+            'Vega': 'Vega_Put',
+            'Open_Interest_Millions': 'OI_Put_Millions'
+        })[['strike_price', 'Ltp_Put', 'IV_Put', 'Delta_Put', 'Gamma_Put', 'Theta_Put', 'Vega_Put', 'OI_Put_Millions']]
+
+        # Merge the two dataframes on 'strike_price'
+        combined_df = pd.merge(call_df_for_merge, put_df_for_merge, on='strike_price', how='outer')
+        combined_df = combined_df.sort_values('strike_price').reset_index(drop=True)
+
+        # Define the final column order
+        final_columns_order = [
+            'IV_Call', 'Delta_Call', 'Gamma_Call', 'Theta_Call', 'Vega_Call', 'Ltp_Call', 'OI_Call_Millions',
+            'strike_price',
+            'Ltp_Put', 'IV_Put', 'Delta_Put', 'Gamma_Put', 'Theta_Put', 'Vega_Put', 'OI_Put_Millions'
+        ]
+
+        combined_df = combined_df[final_columns_order].copy()
+
+        # Find highest OI for coloring
+        max_oi_call_val = combined_df['OI_Call_Millions'].max() if not combined_df['OI_Call_Millions'].isna().all() else np.nan
+        max_oi_put_val = combined_df['OI_Put_Millions'].max() if not combined_df['OI_Put_Millions'].isna().all() else np.nan
+
+        # Function to apply formatting and coloring
+        def format_cell(value, column, is_atm_row, max_call_oi, max_put_oi):
+            if pd.isna(value) or value == '':
+                display_value = ''
+            elif 'OI_Call_Millions' == column:
+                display_value = f"{value:.2f}"
+                if not pd.isna(max_call_oi) and value == max_call_oi:
+                    display_value = f"{RED}{display_value}{RESET}"
+            elif 'OI_Put_Millions' == column:
+                display_value = f"{value:.2f}"
+                if not pd.isna(max_put_oi) and value == max_put_oi:
+                    display_value = f"{GREEN}{display_value}{RESET}"
+            elif 'IV' in column or 'Delta' in column:
+                display_value = f"{value:.4f}"
+            elif 'Gamma' in column:
+                display_value = f"{value:.6f}"
+            elif 'Theta' in column or 'Vega' in column or 'Ltp' in column or 'strike_price' == column:
+                display_value = f"{value:.2f}"
+            else:
+                display_value = str(value)
+
+            if is_atm_row:
+                return f"{YELLOW_BG}{display_value}{RESET}"
+            return display_value
+
+        # Apply formatting and coloring
+        table_data = []
+        for index, row in combined_df.iterrows():
+            is_atm_row = (row['strike_price'] == atm_strike)
+            formatted_row = []
+            for col in final_columns_order:
+                formatted_row.append(format_cell(row[col], col, is_atm_row, max_oi_call_val, max_oi_put_val))
+            table_data.append(formatted_row)
+
+        headers_list = [
+            'IV', 'Delta', 'Gamma', 'Theta', 'Vega', 'Ltp', 'OI(M)',
+            'Strike',
+            'Ltp', 'IV', 'Delta', 'Gamma', 'Theta', 'Vega', 'OI(M)'
+        ]
+
+        # Display results
+        print(f"\nSelected Expiry: {selected_expiry}")
+        print(f"SENSEX Spot Price: {spot_price_call:.2f} | ATM Strike: {atm_strike:.0f}")
+        print("--------------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+        print("                                      Call                                                                Put")
+        print("--------------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+        print(tabulate(table_data, headers=headers_list, tablefmt='fancy_grid', showindex=False))
+
+    else:
+        print("No valid option chain data retrieved.")
