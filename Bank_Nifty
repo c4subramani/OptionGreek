@@ -1,0 +1,793 @@
+import time
+from breeze_connect import BreezeConnect
+from datetime import datetime, timedelta, time as dt_time
+import urllib
+import warnings
+import pandas as pd
+import numpy as np
+from tabulate import tabulate
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings('ignore')
+
+# --- ANSI Escape Codes for Colors and Backgrounds ---
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+CYAN_BG = "\033[46m"
+MAGENTA_BG = "\033[45m"
+BLUE_BG = "\033[44m"
+
+# --- API Credentials and Connection ---
+app_key = "Replace with your actual App Key"
+secret_key = "Replace with your actual Secret Key"
+session_key = "REPLACE WITH YOUR CURRENT SESSION KEY"
+
+breeze = BreezeConnect(api_key=str(app_key))
+breeze.generate_session(api_secret=str(secret_key), session_token=str(session_key))
+
+# --- Constants ---
+risk_free_rate = 0.0725 # 7.25%
+SECONDS_IN_A_YEAR = 365 * 24 * 60 * 60 # For accurate T calculation
+
+# New Constant: Minimum time to expiry in seconds for calculations
+# This helps prevent NaN for today's expiry after 11:30 AM IST but before 3:30 PM IST.
+MIN_TIME_TO_EXPIRY_SECONDS = 60 # e.g., 60 seconds (1 minute)
+
+# --- Global variables to store previous and initial data for trend analysis ---
+previous_combined_df = None # Stores data from the *last* 5-min interval
+initial_combined_df = None  # New: Stores the first data captured after 9:15 AM
+last_atm_strike = None      # To track ATM strike if it shifts
+previous_pcr = None # New: Stores the PCR from the last interval
+
+# --- Global list to store all collected DataFrames for saving at the end ---
+all_day_option_chain_data = []
+
+# --- Helper Functions for Greeks Calculation ---
+# Main Function to Process Option Chain Data for a Single Option Type ---
+def get_and_process_single_option_type_chain(option_type_str, breeze_connection, r_val, input_expiry_date=None):
+    Spot = None
+    error_occurred = False # Flag to indicate if a specific error occurred
+    try:
+        # Fetch NIFTY Spot Price
+        quotes_response = breeze_connection.get_quotes(stock_code="CNXBAN",
+                                                        exchange_code="NSE", #
+                                                        expiry_date="",
+                                                        product_type="cash", #
+                                                        right="",
+                                                        strike_price="") #
+
+        # Check if 'Success' key exists and is not empty, indicating valid response
+        if "Success" in quotes_response and quotes_response["Success"]: #
+            Spot = quotes_response["Success"][0]["ltp"] #
+        else:
+            print(f"Error: 'Success' key not found or empty in BankNifty spot price response: {quotes_response}") #
+            error_occurred = True # Set flag for generic errors
+            return None, None, None, error_occurred # Return None if spot price not found or invalid
+    except Exception as e:
+        error_message = str(e)
+        print(f"Error fetching BankNifty spot price: {error_message}") #
+        if "'BreezeConnect' object has no attribute 'error_exception'" in error_message:
+            error_occurred = True # Set flag for the specific error
+        return None, None, None, error_occurred # Return None if any error occurs during spot price fetch
+
+    if Spot is None: # Double check if Spot was successfully obtained
+        return None, None, None, error_occurred
+
+    ATM = round((Spot) / 100) * 100
+
+    # --- MODIFIED LOGIC FOR EXPIRY DATE SELECTION ---
+    if input_expiry_date:
+        # Use the provided input expiry date directly
+        future_expiry_date = input_expiry_date #
+        print(f"Using provided expiry date: {future_expiry_date}") #
+    else:
+        today = datetime.now()
+
+        # Calculate days until next Thursday for expiry (Thursday is weekday 3)
+        # If today is Thursday and it's 3:30 PM IST or later, use next week's Thursday.
+        days_until_thursday = (3 - today.weekday() + 7) % 7 #
+        if today.weekday() == 3 and today.time() >= dt_time(15, 30): # Changed condition here
+            days_until_thursday = 7 # Shift to next week's Thursday
+
+        next_thursday = today + timedelta(days=days_until_thursday) #
+
+        # Set expiry to 6 AM UTC (which is 11:30 AM IST on the expiry day)
+        # for consistent API calls.
+        # This is the official expiry timestamp for the contract.
+        future_expiry_date = next_thursday.strftime("%Y-%m-%dT06:00:00.000Z") #
+       # print(f"No expiry date provided, calculating next relevant Thursday expiry: {future_expiry_date}") #
+    # --- END OF MODIFIED LOGIC ---
+
+    df = pd.DataFrame() # Initialize df as empty DataFrame
+    try:
+        # Fetch Option Chain Data
+        option_chain_response = breeze_connection.get_option_chain_quotes(stock_code="CNXBAN",
+                                        exchange_code="NFO", #
+                                        product_type="options", #
+                                        expiry_date=future_expiry_date, #
+                                        right=option_type_str) #
+
+        if "Success" in option_chain_response and option_chain_response["Success"]: #
+            df = pd.DataFrame(option_chain_response["Success"]) #
+        else:
+            print(f"Error: 'Success' key not found or empty in {option_type_str.capitalize()} option chain response: {option_chain_response}") #
+            error_occurred = True # Set flag for generic errors
+            return Spot, None, ATM, error_occurred # Return None for df if invalid response
+
+    except Exception as e:
+        print(f"Error fetching {option_type_str.capitalize()} option chain: {e}") #
+        error_occurred = True # Set flag for generic errors
+        return Spot, None, ATM, error_occurred # Return None for df if any error occurs
+
+    required_cols = ['strike_price', 'ltp', 'right', 'stock_code', 'expiry_date', 'open_interest']
+    if df.empty or not all(col in df.columns for col in required_cols):
+        print(f"Missing required columns or empty DataFrame in {option_type_str.capitalize()} data. Columns found: {df.columns.tolist()}") #
+        error_occurred = True # Set flag for generic errors
+        return Spot, None, ATM, error_occurred
+
+    df['strike_price'] = df['strike_price'].astype(float) #
+    df['ltp'] = pd.to_numeric(df['ltp'], errors='coerce') #
+    df['open_interest'] = pd.to_numeric(df['open_interest'], errors='coerce') #
+
+    target_strike = ATM
+    strike_increment = 100
+    range_size_lower = 9
+    range_size_upper = 10
+
+    # DEFINITION OF lower_bound AND upper_bound MOVED HERE
+    lower_bound = target_strike - range_size_lower * strike_increment #
+    upper_bound = target_strike + range_size_upper * strike_increment #
+
+    expected_strikes = ([target_strike - i * strike_increment for i in range(range_size_lower, 0, -1)] + #
+                        [target_strike] + #
+                        [target_strike + i * strike_increment for i in range(1, range_size_upper + 1)]) #
+
+    filtered_df = df[(df['strike_price'] >= lower_bound) & #
+                                 (df['strike_price'] <= upper_bound) & #
+                     (df['strike_price'] % strike_increment == 0)].copy() #
+
+    # Only consider options with valid (non-NaN and positive) LTP for IV calculation
+    filtered_df = filtered_df[filtered_df['ltp'].notna() & (filtered_df['ltp'] > 0)] #
+    filtered_df = filtered_df[filtered_df['open_interest'].notna()] #
+
+    if filtered_df.empty:
+        error_occurred = True # Set flag for generic errors
+        return Spot, None, ATM, error_occurred
+
+    sorted_df = filtered_df.sort_values('strike_price').reset_index(drop=True) #
+
+    # Ensure all expected strikes are present, fill missing with NaN
+
+    final_df = sorted_df[sorted_df['strike_price'].isin(expected_strikes)].copy() #
+
+    missing_strikes = set(expected_strikes) - set(final_df['strike_price'].values) #
+    for strike in sorted(list(missing_strikes)): #
+        # When creating a missing row, set ltp and open_interest to NaN so Greeks won't be calculated
+        missing_row = pd.Series({'strike_price': strike, 'stock_code': 'NIFTY', 'right': option_type_str, #
+                                 'ltp': np.nan, 'open_interest': np.nan, 'expiry_date': future_expiry_date}) #
+
+        # Use pd.concat with ignore_index=True for appending single Series as DataFrame
+        final_df = pd.concat([final_df, pd.DataFrame([missing_row])], ignore_index=True) #
+
+    final_df = final_df.sort_values('strike_price').reset_index(drop=True) #
+
+    final_df['spot_price'] = Spot #
+
+    result_df = final_df.copy() #
+    result_df['Open_Interest_Millions'] = (result_df['open_interest'] / 1_000_000).round(2) #
+
+    # Calculate CE Money / PE Money
+    if option_type_str.lower() == 'call': #
+        result_df['CE_Money'] = (result_df['open_interest'] * result_df['ltp']).round(2) #
+    elif option_type_str.lower() == 'put': #
+        result_df['PE_Money'] = (result_df['open_interest'] * result_df['ltp']).round(2) #
+
+    return Spot, result_df, ATM, error_occurred # Pass the error_occurred flag
+
+# --- Function to analyze trend and determine status ---
+def analyze_trend(current_df, prev_df, current_atm_strike, prev_atm_strike): #
+    if prev_df is None: #
+        return "N/A" # No previous data to compare
+
+    # Find the ATM strike row for comparison
+    current_atm_row_call = current_df[(current_df['strike_price'] == current_atm_strike)] #
+    prev_atm_row_call = prev_df[(prev_df['strike_price'] == prev_atm_strike)] #
+
+    current_atm_row_put = current_df[(current_df['strike_price'] == current_atm_strike)] #
+    prev_atm_row_put = prev_df[(prev_df['strike_price'] == prev_atm_strike)] #
+
+    if current_atm_row_call.empty or prev_atm_row_call.empty or \
+       current_atm_row_put.empty or prev_atm_row_put.empty: #
+        return "Indeterminate (ATM row missing)" #
+
+    # Ensure to use the current LTPs from the appropriate renamed columns
+    call_ltp_change = current_atm_row_call['Ltp_Call'].iloc[0] - prev_atm_row_call['Ltp_Call'].iloc[0] if 'Ltp_Call' in current_atm_row_call.columns and 'Ltp_Call' in prev_atm_row_call.columns else 0
+    put_ltp_change = current_atm_row_put['Ltp_Put'].iloc[0] - prev_atm_row_put['Ltp_Put'].iloc[0] if 'Ltp_Put' in current_atm_row_put.columns and 'Ltp_Put' in prev_atm_row_put.columns else 0
+
+    LTP_CHANGE_THRESHOLD = 0.5 # A reasonable threshold for significant LTP change
+
+    if call_ltp_change > LTP_CHANGE_THRESHOLD and put_ltp_change < -LTP_CHANGE_THRESHOLD: #
+        return "Bullish" #
+    elif put_ltp_change > LTP_CHANGE_THRESHOLD and call_ltp_change < -LTP_CHANGE_THRESHOLD: #
+        return "Bearish" #
+    elif abs(call_ltp_change) < LTP_CHANGE_THRESHOLD and abs(put_ltp_change) < LTP_CHANGE_THRESHOLD: #
+        return "Neutral (Flat/Low Vol)" #
+    elif call_ltp_change < -LTP_CHANGE_THRESHOLD and put_ltp_change < -LTP_CHANGE_THRESHOLD: #
+        return "Neutral (Vol Crush)" # Both calls and puts are falling, implying falling IV
+    elif call_ltp_change > LTP_CHANGE_THRESHOLD and put_ltp_change > LTP_CHANGE_THRESHOLD: #
+        return "Neutral (Vol Expansion)" # Both calls and puts are rising, implying rising IV
+    else: #
+        return "Indeterminate" # Catch-all for less clear scenarios
+
+def determine_oi_status(ltp_change, oi_change, option_type):
+    if pd.isna(ltp_change) or pd.isna(oi_change):
+        return "NA"
+
+    LTP_MOVEMENT_THRESHOLD = 0.5
+    OI_CHANGE_THRESHOLD = 0.05
+
+    if abs(ltp_change) < LTP_MOVEMENT_THRESHOLD and abs(oi_change) < OI_CHANGE_THRESHOLD:
+        return "NTR"
+
+    if option_type == 'call':
+        if ltp_change > LTP_MOVEMENT_THRESHOLD and oi_change > OI_CHANGE_THRESHOLD:
+            return "LB"
+        elif ltp_change < -LTP_MOVEMENT_THRESHOLD and oi_change > OI_CHANGE_THRESHOLD:
+            return "SB"
+        elif ltp_change < -LTP_MOVEMENT_THRESHOLD and oi_change < -OI_CHANGE_THRESHOLD:
+            return "LU"
+        elif ltp_change > LTP_MOVEMENT_THRESHOLD and oi_change < -OI_CHANGE_THRESHOLD:
+            return "SC"
+    elif option_type == 'put':
+        if ltp_change > LTP_MOVEMENT_THRESHOLD and oi_change > OI_CHANGE_THRESHOLD:
+            return "SB"
+        elif ltp_change < -LTP_MOVEMENT_THRESHOLD and oi_change > OI_CHANGE_THRESHOLD:
+            return "LB"
+        elif ltp_change < -LTP_MOVEMENT_THRESHOLD and oi_change < -OI_CHANGE_THRESHOLD:
+            return "SC"
+        elif ltp_change > LTP_MOVEMENT_THRESHOLD and oi_change < -OI_CHANGE_THRESHOLD:
+            return "LU"
+
+    return "NA"
+
+def print_highest_oi_summary(combined_df, previous_df=None):
+    def get_change_arrow(current, previous):
+        if pd.isna(current) or pd.isna(previous):
+            return ""
+        if current > previous:
+            return f"{GREEN}▲{RESET} "
+        elif current < previous:
+            return f"{RED}▼{RESET} "
+        else:
+            return ""
+
+    print(f"{BOLD}📈 Highest Open Interest Summary:{RESET}")
+    print(f"{BOLD} TYPE  ||  STRIKE   ||     OI     ||   LTP    ||   CHG_OI   || STATUS{RESET}")
+    print("-" * 85)
+
+    # --- CE Highest OI Row ---
+    ce_row = combined_df.loc[combined_df['OI_Call_Millions'].idxmax()]
+    ce_strike = int(ce_row['strike_price'])
+    ce_ltp = ce_row['Ltp_Call']
+    ce_oi = int(ce_row['open_interest_call'])
+    ce_chg_oi_val = ce_row.get('Change_in_OI_Call_Millions', 0)
+    ce_chg_oi = int(ce_chg_oi_val * 1_000_000) if pd.notna(ce_chg_oi_val) else 0
+
+    ce_prev_row = previous_df[previous_df['strike_price'] == ce_strike].iloc[0] if previous_df is not None and not previous_df[previous_df['strike_price'] == ce_strike].empty else None
+    ce_ltp_arrow = get_change_arrow(ce_ltp, ce_prev_row['Ltp_Call']) if ce_prev_row is not None else ""
+    ce_oi_arrow = get_change_arrow(ce_oi, ce_prev_row['open_interest_call']) if ce_prev_row is not None else ""
+    ce_chg_oi_arrow = get_change_arrow(ce_chg_oi, ce_prev_row['Change_in_OI_Call_Millions'] * 1_000_000) if ce_prev_row is not None and pd.notna(ce_prev_row['Change_in_OI_Call_Millions']) else ""
+
+    ce_status = determine_oi_status(
+        ce_row.get('Ltp_Call_Change', 0),
+        ce_row.get('Change_in_OI_Call_Millions', 0),
+        'call'
+    )
+
+    print(f"  CE   ||  {ce_strike:<8} ||  {ce_oi_arrow}{ce_oi:<9} ||  {ce_ltp_arrow}{ce_ltp:<7.1f} ||  {ce_chg_oi_arrow}{ce_chg_oi:>7}  || {ce_status}")
+
+    # --- PE Highest OI Row ---
+    pe_row = combined_df.loc[combined_df['OI_Put_Millions'].idxmax()]
+    pe_strike = int(pe_row['strike_price'])
+    pe_ltp = pe_row['Ltp_Put']
+    pe_oi = int(pe_row['open_interest_put'])
+    pe_chg_oi_val = pe_row.get('Change_in_OI_Put_Millions', 0)
+    pe_chg_oi = int(pe_chg_oi_val * 1_000_000) if pd.notna(pe_chg_oi_val) else 0
+
+    pe_prev_row = previous_df[previous_df['strike_price'] == pe_strike].iloc[0] if previous_df is not None and not previous_df[previous_df['strike_price'] == pe_strike].empty else None
+    pe_ltp_arrow = get_change_arrow(pe_ltp, pe_prev_row['Ltp_Put']) if pe_prev_row is not None else ""
+    pe_oi_arrow = get_change_arrow(pe_oi, pe_prev_row['open_interest_put']) if pe_prev_row is not None else ""
+    pe_chg_oi_arrow = get_change_arrow(pe_chg_oi, pe_prev_row['Change_in_OI_Put_Millions'] * 1_000_000) if pe_prev_row is not None and pd.notna(pe_prev_row['Change_in_OI_Put_Millions']) else ""
+
+    pe_status = determine_oi_status(
+        pe_row.get('Ltp_Put_Change', 0),
+        pe_row.get('Change_in_OI_Put_Millions', 0),
+        'put'
+    )
+
+    print(f"  PE   ||  {pe_strike:<8} ||  {pe_oi_arrow}{pe_oi:<9} ||  {pe_ltp_arrow}{pe_ltp:<7.1f} ||  {pe_chg_oi_arrow}{pe_chg_oi:>7}  || {pe_status}")
+    print("-" * 85)
+
+
+# --- Function to display data (common to both single run and loop) ---
+def display_option_chain(combined_df, spot_price, atm_strike, current_trend_status, current_pcr, previous_pcr):
+    # Find highest OI for coloring (only non-NaN values)
+    max_oi_call_val = combined_df['OI_Call_Millions'].max() if not combined_df['OI_Call_Millions'].empty else np.nan #
+    max_oi_put_val = combined_df['OI_Put_Millions'].max() if not combined_df['OI_Put_Millions'].empty else np.nan #
+
+    # Function to apply formatting and coloring
+    def format_cell(value, column, is_atm_row, max_call_oi, max_put_oi, row):
+        display_value = ''
+        if pd.isna(value) or value == '': #
+            display_value = '' #
+        elif 'OI_Call_Millions' == column: #
+            display_value = f"{value:.2f}" #
+            if value == max_call_oi and not pd.isna(max_call_oi): #
+                display_value = f"{RED}{display_value}{RESET}" #
+        elif 'OI_Put_Millions' == column: #
+            display_value = f"{value:.2f}" #
+            if value == max_put_oi and not pd.isna(max_put_oi): #
+                display_value = f"{GREEN}{display_value}{RESET}" #
+        elif 'CE_Money' == column: #
+            money_val = value #
+            money_change = row.get('CE_Money_Change', np.nan) #
+            display_value = f"{money_val:,.2f}" if not pd.isna(money_val) else '' #
+            if not pd.isna(money_change): #
+                if money_change > 0: #
+                    display_value = f"{GREEN}▲ {display_value}" #
+                elif money_change < 0: #
+                    display_value = f"{RED}▼ {display_value}" #
+            display_value += RESET #
+        elif 'PE_Money' == column: #
+            money_val = value #
+            money_change = row.get('PE_Money_Change', np.nan) #
+            display_value = f"{money_val:,.2f}" if not pd.isna(money_val) else '' #
+
+            if not pd.isna(money_change): #
+                if money_change > 0: #
+                    display_value = f"{GREEN}▲ {display_value}" #
+                elif money_change < 0: #
+                    display_value = f"{RED}▼ {display_value}" #
+
+            display_value += RESET #
+        elif 'strike_price' == column: #
+            display_value = f"{value:.0f}" # Round strike price to integer
+        elif 'PCR_Strike' == column: # New PCR_Strike formatting
+            display_value = f"{value:.2f}" if not pd.isna(value) else '' #
+        # --- MODIFIED LTP DISPLAY LOGIC WITH % CHANGE ---
+        elif 'Ltp_Call' == column: #
+            ltp_val = value # Current LTP
+            ltp_change = row.get('Ltp_Call_Change', np.nan) #
+            ltp_pct_change = row.get('Ltp_Call_Pct_Change', np.nan) #
+
+            display_value = f"{ltp_val:.2f}" if not pd.isna(ltp_val) else '' #
+            if not pd.isna(ltp_change): #
+                if ltp_change > 0: #
+                    display_value = f"{GREEN}▲ {display_value}" #
+                elif ltp_change < 0: #
+                    display_value = f"{RED}▼ {display_value}" #
+            if not pd.isna(ltp_pct_change) and not (pd.isna(ltp_val) or ltp_val == 0): # Only show % if LTP is valid
+                display_value += f" ({ltp_pct_change:+.2f}%)" #
+            display_value += RESET #
+
+        elif 'Ltp_Put' == column: #
+            ltp_val = value # Current LTP
+            ltp_change = row.get('Ltp_Put_Change', np.nan) #
+            ltp_pct_change = row.get('Ltp_Put_Pct_Change', np.nan) #
+
+            display_value = f"{ltp_val:.2f}" if not pd.isna(ltp_val) else '' #
+            if not pd.isna(ltp_change): #
+                if ltp_change > 0: #
+                    display_value = f"{GREEN}▲ {display_value}" #
+                elif ltp_change < 0: #
+                    display_value = f"{RED}▼ {display_value}" #
+            if not pd.isna(ltp_pct_change) and not (pd.isna(ltp_val) or ltp_val == 0): # Only show % if LTP is valid
+                display_value += f" ({ltp_pct_change:+.2f}%)" #
+            display_value += RESET #
+        # --- NEW LOGIC FOR EXTRINSIC VALUE ---
+        elif 'CE_E' == column or 'PE_E' == column: #
+            display_value = f"{value:.2f}" if not pd.isna(value) else '' #
+        # --- END NEW LOGIC ---
+        elif 'Change_in_OI' in column: #
+            if not pd.isna(value): # This handles np.nan values correctly
+                if value > 0: #
+                    display_value = f"{GREEN}+{value:.2f}{RESET}" #
+                elif value < 0: #
+                    display_value = f"{RED}{value:.2f}{RESET}" #
+                else: #
+                    display_value = f"{value:.2f}" #
+            else: #
+                display_value = '' # Display empty string for NaN values
+
+        elif 'OI_Status' in column: #
+            if "Long Build-up" in value or "Short Covering" in value: #
+                display_value = f"{GREEN}{value}{RESET}" #
+            elif "Short Build-up" in value or "Long Unwinding" in value: #
+                display_value = f"{RED}{value}{RESET}" #
+            else: #
+                display_value = value #
+        else: #
+            display_value = str(value) #
+
+        # Apply ATM row font color (no background)
+        if is_atm_row: #
+            return f"{YELLOW}{display_value}{RESET}" #
+
+        return display_value #
+
+
+    # Apply formatting and coloring row by row for tabulate
+    table_data = []
+    # These are the columns that will actually be displayed in the table
+    final_columns_order = [
+        'Ltp_Call', 'CE_E', 'CE_Money', 'OI_Call_Millions', 'Change_in_OI_Call_Millions', 'OI_Status_Call', # Added CE_E
+        'strike_price', 'PCR_Strike', # Added PCR_Strike here
+        'Ltp_Put', 'PE_E', 'PE_Money', 'OI_Put_Millions', 'Change_in_OI_Put_Millions', 'OI_Status_Put' # Added PE_E
+    ]
+
+
+    # Ensure all columns in final_columns_order exist in combined_df
+    # and fill with NaN or default strings if missing for consistent display
+    for col in final_columns_order: #
+        if col not in combined_df.columns: #
+            if 'OI_Status' in col: #
+                combined_df[col] = "N/A" #
+            else: #
+                combined_df[col] = np.nan #
+
+    for index, row in combined_df.iterrows(): #
+        is_atm_row = (row['strike_price'] == atm_strike) #
+        formatted_row = [] #
+        for col_name in final_columns_order: #
+            # Pass the entire row to format_cell so it can access 'Ltp_Call_Change' and 'Ltp_Put_Change'
+            formatted_row.append(format_cell(row[col_name], col_name, is_atm_row, max_oi_call_val, max_oi_put_val, row)) #
+        table_data.append(formatted_row) #
+
+
+    # Prepare headers for tabulate - apply BOLD GREEN
+    headers_list = [
+        f"{BOLD}{GREEN}Ltp (%){RESET}", f"{BOLD}{GREEN}CE_E{RESET}", f"{BOLD}{GREEN}CE Money{RESET}", f"{BOLD}{GREEN}OI(M){RESET}", f"{BOLD}{GREEN}Change OI(M){RESET}", f"{BOLD}{GREEN}OI Status{RESET}", # Added CE_E header
+        f"{BOLD}{GREEN}Strike{RESET}", f"{BOLD}{GREEN}PCR{RESET}", # Added PCR header
+        f"{BOLD}{GREEN}Ltp (%){RESET}", f"{BOLD}{GREEN}PE_E{RESET}", f"{BOLD}{GREEN}PE Money{RESET}", f"{BOLD}{GREEN}OI(M){RESET}", f"{BOLD}{GREEN}Change OI(M){RESET}", f"{BOLD}{GREEN}OI Status{RESET}" # Added PE_E header
+    ]
+
+    print(f"\nBankNifty Spot Price: {spot_price:.2f} | ATM Strike: {atm_strike:.0f} | Trend: {current_trend_status}") #
+    print_highest_oi_summary(combined_df, previous_combined_df)
+    print("="*200) # Adjusted separator length for new columns
+
+    trend_header_prefix = ""
+    trend_header_suffix = ""
+    if current_trend_status == "Bullish": #
+        trend_header_prefix = CYAN_BG #
+    elif current_trend_status == "Bearish": #
+        trend_header_prefix = MAGENTA_BG #
+    elif current_trend_status.startswith("Neutral"): #
+        trend_header_prefix = BLUE_BG #
+    trend_header_suffix = RESET # Ensure suffix is always reset
+
+    # Adjusted spacing for the Call/Put header
+    # Adjusted for new PCR column and two new Extrinsic Value columns, total columns are now 13
+    # 6 Call columns, 1 Strike, 1 PCR, 5 Put columns
+    # ' ' * 78 - len('Call') = 74
+    # ' ' * 28 - len('|') = 27
+    print(f"{trend_header_prefix}{' ' * 68}Call{' ' * 24}|{' ' * 23}Put{' ' * 69}{trend_header_suffix}") # Adjusted spacing for 13 columns
+    print("="*200) # Adjusted separator length for new columns
+    print(tabulate(table_data, headers=headers_list, tablefmt='fancy_grid', showindex=False)) #
+
+    # Calculate PCR and summary data
+    total_ce_oi = combined_df['OI_Call_Millions'].sum() * 1_000_000 if 'OI_Call_Millions' in combined_df.columns else 0 #
+    total_pe_oi = combined_df['OI_Put_Millions'].sum() * 1_000_000 if 'OI_Put_Millions' in combined_df.columns else 0 #
+    total_ce_money = combined_df['CE_Money'].sum() if 'CE_Money' in combined_df.columns else 0 #
+    total_pe_money = combined_df['PE_Money'].sum() if 'PE_Money' in combined_df.columns else 0 #
+
+    pcr = total_pe_oi / total_ce_oi if total_ce_oi != 0 else np.nan #
+    
+    # 📈 Highest Open Interest Summary Table
+    print_highest_oi_summary(combined_df, previous_combined_df)
+
+    # ========== Summary Block ==========
+    print("\n" + "="*200)
+    print("Summary:")
+    print(f"Total CE OI: {total_ce_oi:,.0f}")
+    print(f"Total PE OI: {total_pe_oi:,.0f}")
+    print(f"Total CE Money: {total_ce_money:,.2f}")
+    print(f"Total PE Money: {total_pe_money:,.2f}")
+
+    pcr_status_message = ""
+    if not pd.isna(current_pcr):
+        if current_pcr > 1:
+            pcr_status_message = "Bullish"
+        else:
+            pcr_status_message = "Bearish"
+
+        if not pd.isna(previous_pcr):
+            if current_pcr < previous_pcr:
+                pcr_status_message += " (Stay cautious, PCR reducing)"
+            elif current_pcr > previous_pcr:
+                pcr_status_message += " (Stay cautious, PCR increasing)"
+
+    print(f"Overall PCR: {current_pcr:.2f} - {pcr_status_message}" if not pd.isna(current_pcr) else "Overall PCR: N/A")
+    print("=" * 200 + "\n")
+
+# --- Main loop for continuous monitoring (during market hours) ---
+def run_option_chain_monitor(expiry_date_input=None):
+    global previous_combined_df, initial_combined_df, last_atm_strike, all_day_option_chain_data, previous_pcr
+
+    while True:
+        current_time_dt = datetime.now()
+        current_time_str = current_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        now_time_only = current_time_dt.time()
+        market_open = dt_time(9, 15)
+        market_close = dt_time(15, 30)
+
+        if not (market_open <= now_time_only <= market_close and current_time_dt.weekday() < 5): #
+            print(f"\nMarket is closed or it's a weekend. Stopping continuous monitor. Current time: {current_time_str}") #
+            # --- Save all collected data when market closes ---
+            print("Market is closed. Saving all collected option chain data for the day...") #
+            if all_day_option_chain_data: #
+                # Add a 'Snapshot_Timestamp' column to each DataFrame for proper concatenation and tracking
+                for i, df_snapshot in enumerate(all_day_option_chain_data): #
+                    if 'Snapshot_Timestamp' not in df_snapshot.columns: #
+                        pass # Timestamp is added directly when appending
+                final_df_all_day = pd.concat(all_day_option_chain_data, ignore_index=True) #
+                file_name = f"BankNifty_option_chain_all_day_{datetime.now().strftime('%Y%m%d')}.xlsx" #
+                try:
+                    final_df_all_day.to_excel(file_name, index=False) #
+                    print(f"All day option chain data saved to {file_name}") #
+                except Exception as e: #
+                    print(f"Error saving all day data to Excel: {e}") #
+            else: #
+                print("No option chain data was collected today.") #
+            # --- END NEW SAVE LOGIC ---
+            break
+
+        print(f"\n--- Fetching Option Chain Data (As of {current_time_str}) ---") #
+
+        should_retry = False
+        spot_price_call, call_options_df, atm_strike, call_error = get_and_process_single_option_type_chain("call", breeze, risk_free_rate, expiry_date_input) # Updated to receive error flag
+        spot_price_put, put_options_df, _, put_error = get_and_process_single_option_type_chain("put", breeze, risk_free_rate, expiry_date_input) # Updated to receive error flag
+
+        if call_error or put_error: # Check if either call or put fetching had an error
+            should_retry = True # Set flag to retry immediately
+
+        if call_options_df is not None and put_options_df is not None and atm_strike is not None: #
+            # Rename columns directly on the call_options_df and put_options_df
+            call_options_df = call_options_df.rename(columns={
+                         'ltp': 'Ltp_Call', 'Open_Interest_Millions': 'OI_Call_Millions' #
+            }) #
+            if 'CE_Money' not in call_options_df.columns: #
+                call_options_df['CE_Money'] = (call_options_df['open_interest'] * call_options_df['Ltp_Call']).round(2) #
+
+            put_options_df = put_options_df.rename(columns={
+                'ltp': 'Ltp_Put', 'Open_Interest_Millions': 'OI_Put_Millions' #
+            }) #
+            if 'PE_Money' not in put_options_df.columns: #
+                put_options_df['PE_Money'] = (put_options_df['open_interest'] * put_options_df['Ltp_Put']).round(2) #
+
+            # Now merge the two dataframes on 'strike_price'
+            current_combined_df = pd.merge(
+                call_options_df[['strike_price', 'Ltp_Call', 'CE_Money', 'OI_Call_Millions', 'open_interest']], #
+                put_options_df[['strike_price', 'Ltp_Put', 'PE_Money', 'OI_Put_Millions', 'open_interest']], #
+                on='strike_price', #
+                how='outer', #
+                suffixes=('_call', '_put') # Use suffixes to differentiate original OI and LTP
+            ) #
+            current_combined_df = current_combined_df.sort_values('strike_price').reset_index(drop=True) #
+
+
+            # Calculate Extrinsic Value (after merging and ensuring Spot Price is available)
+            # Make sure Spot price is the same for both calls and puts
+            current_combined_df['CE_E'] = current_combined_df.apply(
+                lambda row: row['Ltp_Call'] - max(0, spot_price_call - row['strike_price']) if pd.notna(row['Ltp_Call']) and pd.notna(row['strike_price']) else np.nan, axis=1 #
+            ) #
+            current_combined_df['PE_E'] = current_combined_df.apply(
+                lambda row: row['Ltp_Put'] - max(0, row['strike_price'] - spot_price_call) if pd.notna(row['Ltp_Put']) and pd.notna(row['strike_price']) else np.nan, axis=1 #
+            ) #
+
+
+            # Calculate PCR for each strike - moved up this block
+            # Ensure to use the correct OI columns for PCR calculation
+            current_combined_df['PCR_Strike'] = current_combined_df['OI_Put_Millions'] / current_combined_df['OI_Call_Millions'] #
+            current_combined_df['PCR_Strike'].replace([np.inf, -np.inf], np.nan, inplace=True) # Handle division by zero producing inf
+
+            # --- Logic for Initial Data Capture and OI/LTP Change Calculation ---
+            if initial_combined_df is None: #
+                # This is the first successful fetch after market open (or 9:15 AM)
+                initial_combined_df = current_combined_df.copy() #
+                current_combined_df['Change_in_OI_Call_Millions'] = np.nan # Correct: Initialize with NaN
+                current_combined_df['OI_Status_Call'] = "N/A (Initial Data)" #
+                current_combined_df['Change_in_OI_Put_Millions'] = np.nan # Correct: Initialize with NaN
+                current_combined_df['OI_Status_Put'] = "N/A (Initial Data)" #
+                current_combined_df['Ltp_Call_Change'] = np.nan #
+                current_combined_df['Ltp_Put_Change'] = np.nan #
+                current_combined_df['Ltp_Call_Pct_Change'] = np.nan #
+                current_combined_df['Ltp_Put_Pct_Change'] = np.nan #
+                current_combined_df['CE_Money_Change'] = np.nan  # Initial CE Money Change
+                current_combined_df['PE_Money_Change'] = np.nan # Initial PE Money Change
+            else: #
+                # Calculate Change in OI (vs initial data) for display columns
+                temp_df_oi_initial = pd.merge(current_combined_df, initial_combined_df, on='strike_price', how='left', suffixes=('_curr', '_initial')) #
+
+                # Use _call and _put suffixes as per the merge above for OI and LTP
+                current_combined_df['Change_in_OI_Call_Millions'] = (temp_df_oi_initial['open_interest_call_curr'] - temp_df_oi_initial['open_interest_call_initial']) / 1_000_000 #
+                current_combined_df['Change_in_OI_Put_Millions'] = (temp_df_oi_initial['open_interest_put_curr'] - temp_df_oi_initial['open_interest_put_initial']) / 1_000_000 #
+
+                # Calculate Change in LTP for Calls and Puts (vs initial data)
+                current_combined_df['Ltp_Call_Change'] = temp_df_oi_initial['Ltp_Call_curr'] - temp_df_oi_initial['Ltp_Call_initial'] #
+                current_combined_df['Ltp_Put_Change'] = temp_df_oi_initial['Ltp_Put_curr'] - temp_df_oi_initial['Ltp_Put_initial'] #
+
+                # Calculate Change in CE/PE Money (vs initial data)
+                current_combined_df['CE_Money_Change'] = temp_df_oi_initial['CE_Money_curr'] - temp_df_oi_initial['CE_Money_initial'] #
+                current_combined_df['PE_Money_Change'] = temp_df_oi_initial['PE_Money_curr'] - temp_df_oi_initial['PE_Money_initial'] #
+
+                # Calculate Percentage Change for LTP (Handle division by zero)
+                current_combined_df['Ltp_Call_Pct_Change'] = (current_combined_df['Ltp_Call_Change'] / temp_df_oi_initial['Ltp_Call_initial'] * 100).round(2) #
+                current_combined_df['Ltp_Call_Pct_Change'].replace([np.inf, -np.inf], np.nan, inplace=True) #
+                current_combined_df['Ltp_Put_Pct_Change'] = (current_combined_df['Ltp_Put_Change'] / temp_df_oi_initial['Ltp_Put_initial'] * 100).round(2) #
+
+                current_combined_df['Ltp_Put_Pct_Change'].replace([np.inf, -np.inf], np.nan, inplace=True) #
+
+                # --- NEW LOGIC: Calculate changes vs. previous_combined_df for OI Status ---
+                if previous_combined_df is not None: #
+                    temp_df_oi_previous = pd.merge(current_combined_df, previous_combined_df, on='strike_price', how='left', suffixes=('_curr', '_prev')) #
+
+                    # Ensure columns used for status are available from previous
+                    oi_call_change_interval = (temp_df_oi_previous['open_interest_call_curr'] - temp_df_oi_previous['open_interest_call_prev']) / 1_000_000 #
+                    oi_put_change_interval = (temp_df_oi_previous['open_interest_put_curr'] - temp_df_oi_previous['open_interest_put_prev']) / 1_000_000 #
+                    ltp_call_change_interval = temp_df_oi_previous['Ltp_Call_curr'] - temp_df_oi_previous['Ltp_Call_prev'] #
+                    ltp_put_change_interval = temp_df_oi_previous['Ltp_Put_curr'] - temp_df_oi_previous['Ltp_Put_prev'] #
+
+                    # Determine OI Status using interval changes
+                    current_combined_df['OI_Status_Call'] = current_combined_df.apply( #
+                        lambda row: determine_oi_status( #
+                            ltp_call_change_interval[row.name], # Use .name to get index for Series access
+                            oi_call_change_interval[row.name], #
+                            'call' #
+                        ), axis=1 #
+                    ) #
+                    current_combined_df['OI_Status_Put'] = current_combined_df.apply( #
+                        lambda row: determine_oi_status( #
+                            ltp_put_change_interval[row.name], #
+                            oi_put_change_interval[row.name], #
+                            'put' #
+                        ), axis=1 #
+                    ) #
+                else: # Fallback if previous_combined_df is None (e.g., first iteration, but not initial run)
+                    current_combined_df['OI_Status_Call'] = "N/A (No Previous Data)" #
+                    current_combined_df['OI_Status_Put'] = "N/A (No Previous Data)" #
+                # --- END NEW LOGIC ---
+
+            current_trend_status = analyze_trend(current_combined_df, previous_combined_df, atm_strike, last_atm_strike) #
+
+            # Calculate PCR for overall summary
+            total_ce_oi = current_combined_df['OI_Call_Millions'].sum() * 1_000_000 if 'OI_Call_Millions' in current_combined_df.columns else 0
+            total_pe_oi = current_combined_df['OI_Put_Millions'].sum() * 1_000_000 if 'OI_Put_Millions' in current_combined_df.columns else 0
+            current_pcr_val = total_pe_oi / total_ce_oi if total_ce_oi != 0 else np.nan #
+
+            display_option_chain(current_combined_df, spot_price_call, atm_strike, current_trend_status, current_pcr_val, previous_pcr) #
+
+            # --- Add current timestamp to the DataFrame and append to the list ---
+            # Add a timestamp column to the current snapshot DataFrame
+            current_combined_df['Snapshot_Timestamp'] = current_time_dt #
+            all_day_option_chain_data.append(current_combined_df.copy()) # Append a copy to avoid modifying later
+
+            # Store current data for the next comparison (for analyze_trend and new OI status logic)
+            previous_combined_df = current_combined_df.copy() #
+            last_atm_strike = atm_strike #
+            previous_pcr = current_pcr_val # Update previous_pcr for the next iteration
+        else:
+            print("Could not retrieve full option chain data. Retrying...") #
+            should_retry = True # Set flag to retry immediately if data is not complete
+
+        print("\n" + "="*200) #
+        if should_retry:
+            print(f"Specific error encountered, retrying immediately...")
+            # No sleep, loop will continue immediately
+        else:
+            print(f"Waiting for 3 minutes (180 seconds) before next fetch...") #
+            time.sleep(180) #
+
+# --- Function for single run (for testing outside market hours) ---
+def run_option_chain_monitor_once(expiry_date_input=None):
+    global previous_combined_df, initial_combined_df, last_atm_strike, previous_pcr
+    current_time_dt = datetime.now()
+    current_time_str = current_time_dt.strftime("%Y-%m-%d %H:%M:%S") #
+    print(f"\n--- Performing single data fetch (As of {current_time_str}) ---") #
+
+    spot_price_call, call_options_df, atm_strike, _ = get_and_process_single_option_type_chain("call", breeze, risk_free_rate, expiry_date_input) #
+    spot_price_put, put_options_df, _, _ = get_and_process_single_option_type_chain("put", breeze, risk_free_rate, expiry_date_input) #
+
+    if call_options_df is not None and put_options_df is not None and atm_strike is not None: #
+        # Rename columns directly on the call_options_df and put_options_df
+        call_options_df = call_options_df.rename(columns={
+            'ltp': 'Ltp_Call', 'Open_Interest_Millions': 'OI_Call_Millions' #
+        }) #
+        if 'CE_Money' not in call_options_df.columns: #
+            call_options_df['CE_Money'] = (call_options_df['open_interest'] * call_options_df['Ltp_Call']).round(2) #
+
+        put_options_df = put_options_df.rename(columns={
+            'ltp': 'Ltp_Put', 'Open_Interest_Millions': 'OI_Put_Millions' #
+        }) #
+        if 'PE_Money' not in put_options_df.columns: #
+            put_options_df['PE_Money'] = (put_options_df['open_interest'] * put_options_df['Ltp_Put']).round(2) #
+
+        # Now merge the two dataframes on 'strike_price'
+        current_combined_df = pd.merge(
+            call_options_df[['strike_price', 'Ltp_Call', 'CE_Money', 'OI_Call_Millions', 'open_interest']], #
+            put_options_df[['strike_price', 'Ltp_Put', 'PE_Money', 'OI_Put_Millions', 'open_interest']], #
+            on='strike_price', #
+            how='outer', #
+            suffixes=('_call', '_put') # Use suffixes to differentiate original OI and LTP
+        ) #
+        current_combined_df = current_combined_df.sort_values('strike_price').reset_index(drop=True) #
+
+        # Calculate Extrinsic Value (after merging and ensuring Spot Price is available)
+        current_combined_df['CE_E'] = current_combined_df.apply(
+            lambda row: row['Ltp_Call'] - max(0, spot_price_call - row['strike_price']) if pd.notna(row['Ltp_Call']) and pd.notna(row['strike_price']) else np.nan, axis=1 #
+        ) #
+        current_combined_df['PE_E'] = current_combined_df.apply(
+            lambda row: row['Ltp_Put'] - max(0, row['strike_price'] - spot_price_call) if pd.notna(row['Ltp_Put']) and pd.notna(row['strike_price']) else np.nan, axis=1 #
+        ) #
+
+
+        # Calculate PCR for each strike
+        current_combined_df['PCR_Strike'] = current_combined_df['OI_Put_Millions'] / current_combined_df['OI_Call_Millions'] #
+        current_combined_df['PCR_Strike'].replace([np.inf, -np.inf], np.nan, inplace=True) # Handle division by zero producing inf
+
+        # --- Logic for Initial Data Capture and OI/LTP Change Calculation (for single run, initial is always current) ---
+        initial_combined_df = current_combined_df.copy() # For single run, initial is the current snapshot
+        current_combined_df['Change_in_OI_Call_Millions'] = np.nan # Correct: Initialize with NaN
+        current_combined_df['OI_Status_Call'] = "N/A (Single Run)" #
+        current_combined_df['Change_in_OI_Put_Millions'] = np.nan # Correct: Initialize with NaN
+        current_combined_df['OI_Status_Put'] = "N/A (Single Run)" #
+        current_combined_df['Ltp_Call_Change'] = np.nan #
+        current_combined_df['Ltp_Put_Change'] = np.nan #
+        current_combined_df['Ltp_Call_Pct_Change'] = np.nan #
+        current_combined_df['Ltp_Put_Pct_Change'] = np.nan #
+        current_combined_df['CE_Money_Change'] = np.nan # For single run, no change to display
+        current_combined_df['PE_Money_Change'] = np.nan # For single run, no change to display
+
+        # In a single run, previous_combined_df will be None, so analyze_trend will return "N/A"
+        current_trend_status = analyze_trend(current_combined_df, None, atm_strike, None) #
+
+
+        # Calculate PCR for overall summary for single run
+        total_ce_oi = current_combined_df['OI_Call_Millions'].sum() * 1_000_000 if 'OI_Call_Millions' in current_combined_df.columns else 0 #
+        total_pe_oi = current_combined_df['OI_Put_Millions'].sum() * 1_000_000 if 'OI_Put_Millions' in current_combined_df.columns else 0 #
+        current_pcr_val = total_pe_oi / total_ce_oi if total_ce_oi != 0 else np.nan #
+
+        display_option_chain(current_combined_df, spot_price_call, atm_strike, current_trend_status, current_pcr_val, None) # previous_pcr is None for single run
+    else:
+        print("Could not retrieve full option chain data for single run.") #
+
+# --- Main execution block ---
+if __name__ == "__main__":
+    now_dt = datetime.now() #
+    now_time_only = now_dt.time() #
+    market_open = dt_time(9, 15) #
+    market_close = dt_time(15, 30) #
+
+    # Prompt user for expiry date
+    user_expiry_input = input("Enter expiry date (YYYY-MM-DD, e.g., 2025-06-05) or press Enter for automatic detection: ").strip() #
+
+    # Format the input expiry date if provided
+    formatted_expiry_date = None
+    if user_expiry_input: #
+        try: #
+            # Assuming user inputsYYYY-MM-DD. Convert to Breeze API format.
+            formatted_expiry_date = datetime.strptime(user_expiry_input, "%Y-%m-%d").strftime("%Y-%m-%dT06:00:00.000Z") #
+        except ValueError: #
+            print("Invalid date format. Using automatic expiry detection.") #
+            formatted_expiry_date = None # Reset to None if invalid
+
+    # Automatically start continuous monitoring during market hours
+    if market_open <= now_time_only <= market_close and now_dt.weekday() < 5: #
+        print(f"Starting continuous option chain monitor. Current time: {now_dt.strftime('%H:%M:%S')}") #
+        run_option_chain_monitor(formatted_expiry_date)  # Pass the input
+    else: #
+        print(f"Market is currently closed. Running a single data fetch for testing. Current time: {now_dt.strftime('%Y-%m-%d %H:%M:%S')} (Weekday: {now_dt.weekday()}).") #
+        run_option_chain_monitor_once(formatted_expiry_date) # Pass the input
